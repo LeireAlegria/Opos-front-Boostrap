@@ -268,6 +268,15 @@ function SettingsPage() {
   const [isSavingTimezone, setIsSavingTimezone] = useState(false)
   const [logoutMessage, setLogoutMessage] = useState('')
   const [isLoggingOut, setIsLoggingOut] = useState(false)
+  const [subscription, setSubscription] = useState<{
+    plan: string | null
+    status: string | null
+    currentPeriodEnd: string | null
+    cancelAtPeriodEnd: boolean
+    premiumAvailable: boolean
+  } | null>(null)
+  const [isOpeningPortal, setIsOpeningPortal] = useState(false)
+  const [subscriptionMessage, setSubscriptionMessage] = useState('')
 
   useEffect(() => {
     fetch(`${apiBaseUrl}/auth/session`, { credentials: 'include' })
@@ -286,7 +295,38 @@ function SettingsPage() {
         }
       })
       .catch(() => undefined)
+
+    fetch(`${apiBaseUrl}/billing/subscription/`, { credentials: 'include' })
+      .then((response) => response.ok ? response.json() : null)
+      .then((payload) => {
+        if (payload) setSubscription(payload)
+      })
+      .catch(() => undefined)
   }, [])
+
+  const openSubscriptionPortal = async () => {
+    setSubscriptionMessage('')
+    setIsOpeningPortal(true)
+    try {
+      const csrfResponse = await fetch(`${apiBaseUrl}/csrf`, { credentials: 'include' })
+      if (!csrfResponse.ok) throw new Error('No se pudo preparar la gestión de la suscripción.')
+      const { csrfToken } = await csrfResponse.json() as { csrfToken: string }
+      const response = await fetch(`${apiBaseUrl}/billing/portal/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+        body: '{}',
+      })
+      const payload = await response.json() as { url?: string; error?: { message?: string } }
+      if (!response.ok) throw new Error(payload.error?.message || 'No se pudo abrir el portal.')
+      if (!payload.url) throw new Error('El portal de facturación no devolvió una dirección válida.')
+      window.location.assign(payload.url)
+    } catch (error) {
+      setSubscriptionMessage(error instanceof Error ? error.message : 'No se pudo abrir el portal.')
+    } finally {
+      setIsOpeningPortal(false)
+    }
+  }
 
   const saveSettings = async (endpoint: string, data: Record<string, string>) => {
     const csrfResponse = await fetch(`${apiBaseUrl}/csrf`, { credentials: 'include' })
@@ -375,9 +415,16 @@ function SettingsPage() {
               <span className="settings-row-label">Plan</span>
               <p>Práctica ilimitada y exámenes completos.</p>
               <div className="settings-plan-actions">
-                <strong>Gratis</strong>
-                <a href="/premium-upgrade/">Mejorar</a>
+                <strong>{subscription?.premiumAvailable ? 'Premium' : 'Gratis'}</strong>
+                {subscription?.premiumAvailable ? (
+                  <button type="button" onClick={openSubscriptionPortal} disabled={isOpeningPortal}>
+                    {isOpeningPortal ? 'Abriendo…' : 'Gestionar suscripción'}
+                  </button>
+                ) : (
+                  <a href="/premium-upgrade/">Mejorar</a>
+                )}
               </div>
+              {subscriptionMessage && <p className="settings-feedback" role="alert">{subscriptionMessage}</p>}
             </div>
 
             <div className="settings-section-divider" />
@@ -505,20 +552,61 @@ const premiumFeatures = [
   { icon: '🛡️', title: 'Garantía de devolución', description: 'Consulta las condiciones antes de contratar.' },
 ]
 
-const premiumTrialEndDate = new Date()
-premiumTrialEndDate.setDate(premiumTrialEndDate.getDate() + 7)
-const formattedPremiumTrialEndDate = new Intl.DateTimeFormat('es-ES', {
-  day: 'numeric',
-  month: 'long',
-  year: 'numeric',
-}).format(premiumTrialEndDate)
-
-function isCheckoutSessionResponse(value: unknown): value is { checkoutUrl: string } {
+function isCheckoutSessionResponse(value: unknown): value is { url: string } {
   return (
     typeof value === 'object' &&
     value !== null &&
-    'checkoutUrl' in value &&
-    typeof value.checkoutUrl === 'string'
+    'url' in value &&
+    typeof value.url === 'string'
+  )
+}
+
+function PaymentSuccessPage() {
+  const [subscription, setSubscription] = useState<{
+    status: string | null
+    premiumAvailable: boolean
+  } | null>(null)
+
+  useEffect(() => {
+    fetch(`${apiBaseUrl}/billing/subscription/`, { credentials: 'include' })
+      .then((response) => response.ok ? response.json() : null)
+      .then((payload) => setSubscription(payload))
+      .catch(() => undefined)
+  }, [])
+
+  return (
+    <div className="landing">
+      <SiteHeader />
+      <main className="api-status-page">
+        {subscription?.premiumAvailable ? (
+          <>
+            <p role="status">Tu suscripción Premium está activa.</p>
+            <a href="/settings">Gestionar suscripción</a>
+          </>
+        ) : (
+          <>
+            <p role="status">Estamos comprobando tu pago. El estado puede tardar unos instantes en activarse.</p>
+            <button type="button" onClick={() => window.location.reload()}>Comprobar de nuevo</button>
+          </>
+        )}
+        <a href="/">Volver al catálogo</a>
+      </main>
+      <SiteFooter />
+    </div>
+  )
+}
+
+function PaymentCancelPage() {
+  return (
+    <div className="landing">
+      <SiteHeader />
+      <main className="api-status-page">
+        <p role="status">El pago fue cancelado. No se ha activado ninguna suscripción.</p>
+        <a href="/premium-upgrade/">Volver a intentar el pago</a>
+        <a href="/">Ver los planes disponibles</a>
+      </main>
+      <SiteFooter />
+    </div>
   )
 }
 
@@ -545,15 +633,15 @@ function PremiumUpgradePage() {
     setCheckoutError('')
 
     try {
-      const response = await fetch('/api/subscriptions/checkout', {
+      const csrfResponse = await fetch(`${apiBaseUrl}/csrf`, { credentials: 'include' })
+      if (!csrfResponse.ok) throw new Error('No se pudo preparar el pago.')
+      const { csrfToken } = await csrfResponse.json() as { csrfToken: string }
+
+      const response = await fetch(`${apiBaseUrl}/billing/checkout/`, {
         method: 'POST',
         credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          planId: 'premium-monthly',
-          successUrl: new URL('/premium-upgrade/?checkout=success', window.location.origin).toString(),
-          cancelUrl: new URL('/premium-upgrade/', window.location.origin).toString(),
-        }),
+        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+        body: JSON.stringify({ planId: 'premium-monthly' }),
       })
 
       if (!response.ok) {
@@ -569,7 +657,7 @@ function PremiumUpgradePage() {
         throw new Error('El servicio de pago devolvió una respuesta no válida.')
       }
 
-      const checkoutUrl = new URL(result.checkoutUrl)
+      const checkoutUrl = new URL(result.url)
       if (
         checkoutUrl.protocol !== 'https:' ||
         !['checkout.stripe.com', 'buy.stripe.com'].includes(checkoutUrl.hostname)
@@ -677,14 +765,12 @@ function PremiumUpgradePage() {
               </svg>
             </div>
             <div className="upgrade-plan-body">
-              <strong className="upgrade-trial">7 días gratis</strong>
+              <strong className="upgrade-trial">Primer pago: 1 €</strong>
               <p className="upgrade-trial-copy">
-                Prueba gratuita hasta el <strong>{formattedPremiumTrialEndDate}</strong>
-                <br />
-                Después, 29,95 € al mes desde el <strong>{formattedPremiumTrialEndDate}</strong>
+                Paga 1 € al activar Premium y luego 29,95 € cada mes.
               </p>
               <div className="upgrade-trial-reminder">
-                🔒 Empieza tu prueba hoy — cancela cuando quieras
+                🔒 Activa Premium hoy — cancela cuando quieras
               </div>
               <button
                 type="button"
@@ -693,7 +779,7 @@ function PremiumUpgradePage() {
                 disabled={isCheckoutLoading}
                 aria-busy={isCheckoutLoading}
               >
-                {isCheckoutLoading ? 'Conectando con Stripe…' : 'Empezar prueba'}
+                {isCheckoutLoading ? 'Conectando con Stripe…' : 'Activar Premium'}
               </button>
               {checkoutError && (
                 <p className="upgrade-checkout-error" role="alert">{checkoutError}</p>
@@ -1361,6 +1447,14 @@ function App() {
 
   if (currentPath === '/premium-upgrade') {
     return <PremiumUpgradePage />
+  }
+
+  if (currentPath === '/payment/success') {
+    return <PaymentSuccessPage />
+  }
+
+  if (currentPath === '/payment/cancel') {
+    return <PaymentCancelPage />
   }
 
   if (examRoute && topicSlug) {
